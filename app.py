@@ -318,31 +318,49 @@ def parallel_search_stores(
 with st.sidebar:
     st.header("⚙️ 設定")
 
+    # ローカル環境かどうかを判定
+    import socket
+    try:
+        _hostname = socket.gethostname()
+        _is_local = any([
+            os.getenv('STREAMLIT_SERVER_ADDRESS', '').startswith('localhost'),
+            os.getenv('STREAMLIT_SERVER_ADDRESS', '') == '',
+            _hostname in ('localhost', '127.0.0.1'),
+        ])
+    except Exception:
+        _is_local = False
+
     with st.expander("🔑 SerpAPI キー設定", expanded=not bool(st.session_state.api_key)):
         new_api_key = st.text_input(
             "API キーを入力",
-            value=st.session_state.api_key,
+            value="",   # 常に空欄（セキュリティ上、値を表示しない）
             type="password",
+            placeholder="SerpAPIキーを入力してください",
             help="SerpAPIの管理画面から取得したAPIキーを入力してください。"
         )
-        
+
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
             if st.button("設定を保存", use_container_width=True):
-                st.session_state.api_key = new_api_key
-                st.success("保存しました")
-                st.rerun()
+                if new_api_key.strip():
+                    st.session_state.api_key = new_api_key.strip()
+                    st.success("保存しました")
+                    st.rerun()
+                else:
+                    st.warning("APIキーを入力してください")
         with col_btn2:
             if st.button("クリア", use_container_width=True):
                 st.session_state.api_key = ""
                 st.rerun()
-        
-        # 環境変数からの読み込みボタン
-        env_key = os.getenv('SERPAPI_KEY') or os.getenv('SERP_API_KEY')
-        if env_key:
-            if st.button("環境変数から読み込む", use_container_width=True):
-                st.session_state.api_key = env_key
-                st.rerun()
+
+        # ローカル環境のみ、環境変数から読み込むボタンを表示
+        if _is_local:
+            env_key = os.getenv('SERPAPI_KEY') or os.getenv('SERP_API_KEY')
+            if env_key:
+                if st.button("🏠 .envから読み込む（ローカル専用）", use_container_width=True):
+                    st.session_state.api_key = env_key
+                    st.success("読み込みました")
+                    st.rerun()
 
     api_key = st.session_state.api_key
     if not api_key:
