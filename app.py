@@ -25,7 +25,7 @@ st.set_page_config(
 load_dotenv()
 
 if 'api_key' not in st.session_state:
-    st.session_state.api_key = os.getenv('SERPAPI_KEY') or os.getenv('SERP_API_KEY') or ""
+    st.session_state.api_key = ""
 
 # ============================================================
 # 検索結果キャッシュ（スレッドセーフなモジュールレベルdict）
@@ -318,22 +318,37 @@ def parallel_search_stores(
 with st.sidebar:
     st.header("⚙️ 設定")
 
-    new_api_key = st.text_input(
-        "SerpAPI キー",
-        value=st.session_state.api_key,
-        type="password",
-        help="SerpAPIの管理画面から取得したAPIキーを入力してください。"
-    )
-    if new_api_key != st.session_state.api_key:
-        st.session_state.api_key = new_api_key
-        st.rerun()
+    with st.expander("🔑 SerpAPI キー設定", expanded=not bool(st.session_state.api_key)):
+        new_api_key = st.text_input(
+            "API キーを入力",
+            value=st.session_state.api_key,
+            type="password",
+            help="SerpAPIの管理画面から取得したAPIキーを入力してください。"
+        )
+        
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("設定を保存", use_container_width=True):
+                st.session_state.api_key = new_api_key
+                st.success("保存しました")
+                st.rerun()
+        with col_btn2:
+            if st.button("クリア", use_container_width=True):
+                st.session_state.api_key = ""
+                st.rerun()
+        
+        # 環境変数からの読み込みボタン
+        env_key = os.getenv('SERPAPI_KEY') or os.getenv('SERP_API_KEY')
+        if env_key:
+            if st.button("環境変数から読み込む", use_container_width=True):
+                st.session_state.api_key = env_key
+                st.rerun()
 
     api_key = st.session_state.api_key
-
     if not api_key:
         st.error("⚠️ APIキーが設定されていません。")
     else:
-        st.success("✅ APIキーが設定されています")
+        st.success("✅ APIキー設定済み")
 
     st.markdown("---")
     st.markdown("### ⚡ 並列処理設定")
@@ -405,6 +420,13 @@ if uploaded_file is not None:
             index=columns.index(auto_detected_col) if auto_detected_col else 0,
         )
 
+        phone_col_input = st.selectbox(
+            "既存の電話番号の列を選択（任意）",
+            ["指定なし"] + columns,
+            index=0,
+            help="既に電話番号が入っている行をスキップしたい場合に選択してください"
+        )
+
         st.markdown("#### 📍 共通検索条件（任意）")
         col_cond1, col_cond2 = st.columns(2)
 
@@ -440,48 +462,92 @@ if uploaded_file is not None:
                 if not store_names:
                     st.warning("⚠️ 屋号が含まれていません")
                 else:
-                    # 座標取得
-                    location_str_csv = None
-                    if location_name:
-                        with st.spinner(f"「{location_name}」の座標を取得しています..."):
-                            geo_result = get_coordinates_from_address(location_name)
-                            if geo_result['success']:
-                                center_lat_csv = geo_result['latitude']
-                                center_lon_csv = geo_result['longitude']
-                                zoom_csv = radius_to_zoom_level(radius_meters_csv) if radius_meters_csv else 14
-                                location_str_csv = f"@{center_lat_csv},{center_lon_csv},{zoom_csv}z"
-                                st.success(f"✅ 座標を取得しました: {geo_result['address']}")
-                            else:
-                                st.warning(f"⚠️ 座標を取得できませんでした: {geo_result.get('error', '')}")
-                    elif use_radius_csv and center_lat_csv and center_lon_csv:
-                        zoom_csv = radius_to_zoom_level(radius_meters_csv) if radius_meters_csv else 14
-                        location_str_csv = f"@{center_lat_csv},{center_lon_csv},{zoom_csv}z"
+                    # --- 既存の電話番号がある行をスキップする判定 ---
+                    search_targets = []
+                    skipped_already_has_phone = []
+                    
+                    for i, row in df_uploaded.iterrows():
+                        name = str(row[store_name_col])
+                        if pd.isna(row[store_name_col]) or name.strip() == "":
+                            continue
+                            
+                        has_phone = False
+                        if phone_col_input != "指定なし":
+                            val = str(row[phone_col_input]).strip()
+                            if val and val.lower() not in ["nan", "none"]:
+                                has_phone = True
+                        
+                        if has_phone:
+                            # 既に電話番号がある場合は、検索結果をシミュレート
+                            simulated_result = {
+                                'success': True,
+                                '店舗名': name,
+                                '電話番号': str(row[phone_col_input]),
+                                '住所': str(row.get('住所', '')) if '住所' in row else '',
+                                '緯度': row.get('緯度') if '緯度' in row else None,
+                                '経度': row.get('経度') if '経度' in row else None,
+                                '評価': row.get('評価') if '評価' in row else '',
+                                'レビュー数': row.get('レビュー数') if 'レビュー数' in row else '',
+                                '信頼度': 'Existing',
+                                'is_existing': True
+                            }
+                            skipped_already_has_phone.append((name, simulated_result))
+                        else:
+                            search_targets.append(name)
 
-                    # 進捗表示
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+                    if not search_targets and not skipped_already_has_phone:
+                        st.warning("⚠️ 検索対象の店舗がありません")
+                    else:
+                        # 座標取得
+                        location_str_csv = None
+                        if location_name:
+                            with st.spinner(f"「{location_name}」の座標を取得しています..."):
+                                geo_result = get_coordinates_from_address(location_name)
+                                if geo_result['success']:
+                                    center_lat_csv = geo_result['latitude']
+                                    center_lon_csv = geo_result['longitude']
+                                    zoom_csv = radius_to_zoom_level(radius_meters_csv) if radius_meters_csv else 14
+                                    location_str_csv = f"@{center_lat_csv},{center_lon_csv},{zoom_csv}z"
+                                    st.success(f"✅ 座標を取得しました: {geo_result['address']}")
+                                else:
+                                    st.warning(f"⚠️ 座標を取得できませんでした: {geo_result.get('error', '')}")
+                        elif use_radius_csv and center_lat_csv and center_lon_csv:
+                            zoom_csv = radius_to_zoom_level(radius_meters_csv) if radius_meters_csv else 14
+                            location_str_csv = f"@{center_lat_csv},{center_lon_csv},{zoom_csv}z"
 
-                    def update_progress(completed, total, current_name):
-                        progress_bar.progress(completed / total)
-                        cached = get_cached_result(current_name, location_str_csv, location_name or None)
-                        cache_tag = " ⚡キャッシュ" if cached else ""
-                        status_text.text(f"完了: {completed}/{total} - {current_name}{cache_tag}")
+                        # --- 並列検索実行 ---
+                        parallel_results = []
+                        if search_targets:
+                            # 進捗表示
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
 
-                    start_time = time.time()
+                            def update_progress(completed, total, current_name):
+                                progress_bar.progress(completed / total)
+                                cached = get_cached_result(current_name, location_str_csv, location_name or None)
+                                cache_tag = " ⚡キャッシュ" if cached else ""
+                                status_text.text(f"完了: {completed}/{total} - {current_name}{cache_tag}")
 
-                    # ★ 並列検索実行
-                    parallel_results = parallel_search_stores(
-                        store_names=store_names,
-                        location_str=location_str_csv,
-                        api_key=api_key,
-                        location_hint=location_name or None,
-                        max_workers=max_workers,
-                        progress_callback=update_progress,
-                    )
+                            start_time = time.time()
+                            parallel_results = parallel_search_stores(
+                                store_names=search_targets,
+                                location_str=location_str_csv,
+                                api_key=api_key,
+                                location_hint=location_name or None,
+                                max_workers=max_workers,
+                                progress_callback=update_progress,
+                            )
+                            elapsed = time.time() - start_time
+                            progress_bar.progress(1.0)
+                            status_text.empty()
+                        else:
+                            elapsed = 0
+                            st.info("💡 全ての行に既に電話番号が入っているため、新規検索をスキップしました。")
 
-                    elapsed = time.time() - start_time
-                    progress_bar.progress(1.0)
-                    status_text.empty()
+                        # 結果の統合（新規検索結果 + 既存スキップ分）
+                        # 順序を維持するために、元のdfのインデックス順に並べ直すのが理想だが、
+                        # 現状のロジックでは parallel_results をそのまま使っているので、一旦結合する。
+                        all_final_results = parallel_results + skipped_already_has_phone
 
                     # ============================================================
                     # 結果整形 ＋ 重複検出
@@ -491,7 +557,7 @@ if uploaded_file is not None:
                     seen_input_names = {}
                     seen_result_keys = {}
 
-                    for row_idx, (store_name, result) in enumerate(parallel_results):
+                    for row_idx, (store_name, result) in enumerate(all_final_results):
                         row_result = {
                             '屋号（入力値）': store_name,
                             '取得店舗名': result.get('店舗名', ''),
@@ -552,9 +618,10 @@ if uploaded_file is not None:
                         df_skipped = pd.DataFrame(skipped_list) if skipped_list else pd.DataFrame()
                         per_store = elapsed / len(store_names) if store_names else 0
 
+                        existing_skip_count = len(skipped_already_has_phone)
                         st.success(
-                            f"✅ 検索完了：取得 **{len(results_list)}件** ／ 重複スキップ **{len(skipped_list)}件**"
-                            f"　⏱️ 所要時間: {elapsed:.1f}秒（1件あたり {per_store:.2f}秒）"
+                            f"✅ 処理完了：新規取得 **{len(results_list) - existing_skip_count}件** ／ 既存スキップ **{existing_skip_count}件** ／ 重複スキップ **{len(skipped_list)}件**"
+                            f"　⏱️ 所要時間: {elapsed:.1f}秒"
                         )
 
                         tab_result1, tab_result2, tab_result3, tab_result4 = st.tabs([
@@ -583,7 +650,13 @@ if uploaded_file is not None:
                                         st.markdown(f"📍 **住所:** {row['住所']}")
                                     if row.get('距離（m）'):
                                         st.markdown(f"📏 **距離:** {row['距離（m）']}m")
-                                    confidence_emoji = {'Very High': '🟢', 'High': '🟡', 'Mid': '🟠', 'Low': '🔴'}.get(row.get('信頼度', 'Low'), '⚪')
+                                    confidence_emoji = {
+                                        'Very High': '🟢', 
+                                        'High': '🟡', 
+                                        'Mid': '🟠', 
+                                        'Low': '🔴',
+                                        'Existing': '🔵'
+                                    }.get(row.get('信頼度', 'Low'), '⚪')
                                     st.markdown(f"{confidence_emoji} **信頼度:** {row.get('信頼度', 'Low')}")
                                     if row['エラー']:
                                         st.warning(f"⚠️ {row['エラー']}")
