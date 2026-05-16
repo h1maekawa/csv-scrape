@@ -483,11 +483,34 @@ if uploaded_file is not None:
                     # --- 既存の電話番号がある行をスキップする判定 ---
                     search_targets = []
                     skipped_already_has_phone = []
+                    skipped_duplicate_inputs = []
+                    seen_input_names_pre = {}
                     
                     for i, row in df_uploaded.iterrows():
                         name = str(row[store_name_col])
                         if pd.isna(row[store_name_col]) or name.strip() == "":
                             continue
+                            
+                        # APIリクエスト前に重複をチェックし、クレジット消費を防ぐ
+                        name_key = name.strip()
+                        if name_key in seen_input_names_pre:
+                            simulated_result = {
+                                'success': False,
+                                '店舗名': '',
+                                '電話番号': '',
+                                '住所': '',
+                                '緯度': None,
+                                '経度': None,
+                                '評価': '',
+                                'レビュー数': '',
+                                '信頼度': 'Low',
+                                'error': '入力値の重複（APIリクエストスキップ）',
+                                'is_duplicate_input': True
+                            }
+                            skipped_duplicate_inputs.append((name, simulated_result))
+                            continue
+                            
+                        seen_input_names_pre[name_key] = i
                             
                         has_phone = False
                         if phone_col_input != "指定なし":
@@ -562,10 +585,10 @@ if uploaded_file is not None:
                             elapsed = 0
                             st.info("💡 全ての行に既に電話番号が入っているため、新規検索をスキップしました。")
 
-                        # 結果の統合（新規検索結果 + 既存スキップ分）
+                        # 結果の統合（新規検索結果 + 既存スキップ分 + 重複スキップ分）
                         # 順序を維持するために、元のdfのインデックス順に並べ直すのが理想だが、
                         # 現状のロジックでは parallel_results をそのまま使っているので、一旦結合する。
-                        all_final_results = parallel_results + skipped_already_has_phone
+                        all_final_results = parallel_results + skipped_already_has_phone + skipped_duplicate_inputs
 
                     # ============================================================
                     # 結果整形 ＋ 重複検出
