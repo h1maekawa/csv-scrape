@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phone Number Extractor - 店舗電話番号一括抽出ツール</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Noto+Sans+JP:wght@300;400;700;900&display=swap" rel="stylesheet">
+    <!-- Phosphor Icons for UI elements -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+<body>
+    <div class="bg-wrapper">
+        <div class="bg-overlay"></div>
+    </div>
+
+    <nav class="navbar glass">
+        <div class="nav-content">
+            <div class="logo">
+                <i class="ph ph-phone-call"></i>
+                <span>Phone Extractor</span>
+            </div>
+            <div class="nav-links">
+                <a href="#features">機能</a>
+                <a href="#how-to-use">使い方</a>
+                <a href="#setup">ローカル起動</a>
+            </div>
+            <a href="https://github.com/h1maekawa/csv-scrape" class="btn btn-outline" target="_blank" rel="noopener">
+                <i class="ph ph-github-logo"></i> GitHub
+            </a>
+        </div>
+    </nav>
+
+    <main>
+        <section class="hero">
+            <div class="hero-content fade-in-up">
+                <div class="badge">Next Generation Data Pipeline</div>
+                <h1 class="hero-title">大量の店舗電話番号を<br><span class="gradient-text">一瞬で抽出</span></h1>
+                <p class="hero-subtitle">SerpAPIを活用し、CSVのリストからGoogle Maps上の電話番号、住所、座標を高精度に一括取得するローカル専用ツール。</p>
+                <div class="hero-actions">
+                    <a href="#setup" class="btn btn-primary">起動方法を見る <i class="ph ph-arrow-right"></i></a>
+                    <a href="#features" class="btn btn-secondary">機能詳細</a>
+                </div>
+            </div>
+            
+            <div class="hero-image-wrapper fade-in-up delay-1">
+                <div class="glass-panel mockup">
+                    <div class="mockup-header">
+                        <div class="dots"><span></span><span></span><span></span></div>
+                        <div class="title">Streamlit App - http://localhost:8501</div>
+                    </div>
+                    <div class="mockup-body">
+                        <div class="mockup-sidebar">
+                            <div class="mockup-item"><i class="ph ph-key"></i> API設定</div>
+                            <div class="mockup-item active"><i class="ph ph-file-csv"></i> CSVアップロード</div>
+                            <div class="mockup-item"><i class="ph ph-sliders"></i> 検索設定</div>
+                        </div>
+                        <div class="mockup-main">
+                            <h2>📞 店舗電話番号抽出ツール</h2>
+                            <div class="mockup-dropzone">
+                                <i class="ph ph-upload-simple"></i>
+                                <p>CSVファイルをここにドラッグ＆ドロップ</p>
+                            </div>
+                            <div class="mockup-btn">🔍 電話番号を取得</div>
+                            <div class="mockup-results">
+                                <div class="result-bar"></div>
+                                <div class="result-bar"></div>
+                                <div class="result-bar short"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="features" class="features">
+            <h2 class="section-title">革新的な<span class="gradient-text">機能</span></h2>
+            <div class="feature-grid">
+                <div class="feature-card glass hover-effect">
+                    <div class="feature-icon"><i class="ph ph-rocket-launch"></i></div>
+                    <h3>高速並列処理</h3>
+                    <p>マルチスレッド処理により、数百件のリストでも驚異的なスピードでAPIを実行します。実行速度はサイドバーから調整可能です。</p>
+                </div>
+                <div class="feature-card glass hover-effect">
+                    <div class="feature-icon"><i class="ph ph-shield-check"></i></div>
+                    <h3>賢い重複排除機能</h3>
+                    <p>同一CSV内の重複を自動検知しAPI通信をスキップ。さらにメモリキャッシュにより再検索時もクレジット消費をゼロに抑えます。</p>
+                </div>
+                <div class="feature-card glass hover-effect">
+                    <div class="feature-icon"><i class="ph ph-map-pin"></i></div>
+                    <h3>高度な半径検索</h3>
+                    <p>地名や座標から中心点を設定し「半径〇〇メートル以内の店舗」に絞り込んだ精密な検索・フィルタリングに対応しています。</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="how-to-use" class="how-to-use">
+            <h2 class="section-title">ツールの<span class="gradient-text">使い方</span></h2>
+            <div class="steps-container">
+                <div class="step glass">
+                    <div class="step-number">1</div>
+                    <h3>CSVの準備とアップロード</h3>
+                    <p>屋号（店名）が記載されたCSVまたはExcelファイルをアップロードします。「店名」列を自動認識します。</p>
+                </div>
+                <div class="step glass">
+                    <div class="step-number">2</div>
+                    <h3>検索条件の設定</h3>
+                    <p>必要に応じて「地域（例：渋谷区）」や「検索半径（例：1000m）」を指定し、検索精度を高めます。</p>
+                </div>
+                <div class="step glass">
+                    <div class="step-number">3</div>
+                    <h3>取得とダウンロード</h3>
+                    <p>ボタン一つで一括取得を開始。取得後はCSVとしてダウンロード可能。重複や取得不可のデータも明確にタブ分けされます。</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="setup" class="setup-section">
+            <div class="glass terminal-wrapper">
+                <div class="terminal-header">
+                    <div class="dots"><span></span><span></span><span></span></div>
+                    <span class="terminal-title">ローカル起動の手順</span>
+                </div>
+                <div class="terminal-body">
+                    <p class="comment"># 1. リポジトリをクローン</p>
+                    <p><span class="prompt">$</span> git clone https://github.com/h1maekawa/csv-scrape.git</p>
+                    <p><span class="prompt">$</span> cd csv-scrape</p>
+                    <br>
+                    <p class="comment"># 2. 依存関係のインストール</p>
+                    <p><span class="prompt">$</span> python -m venv .venv</p>
+                    <p><span class="prompt">$</span> source .venv/bin/activate</p>
+                    <p><span class="prompt">$</span> pip install -r requirements.txt</p>
+                    <br>
+                    <p class="comment"># 3. アプリケーションの起動</p>
+                    <p><span class="prompt">$</span> streamlit run app.py</p>
+                </div>
+            </div>
+
+            <div class="security-warning glass alert">
+                <div class="alert-icon"><i class="ph ph-warning-octagon"></i></div>
+                <div class="alert-content">
+                    <h3>【重要】セキュリティに関する警告</h3>
+                    <p>このアプリケーションは <strong>SerpAPI</strong> を使用します。<br>
+                    <strong>APIキーは絶対に GitHub などの公開リポジトリやインターネット上にアップロードしないでください。</strong></p>
+                    <p>APIキーはローカル環境の <code>.env</code> ファイルに保存するか、アプリ画面のサイドバーから一時的に入力してご使用ください。</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <p>© 2026 Phone Number Extractor. All rights reserved.</p>
+    </footer>
+
+    <script>
+        // Simple Intersection Observer for scroll animations
+        const observerOptions = {
+            threshold: 0.1,
+            rootMargin: "0px 0px -50px 0px"
+        };
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('visible');
+                    observer.unobserve(entry.target);
+                }
+            });
+        }, observerOptions);
+
+        document.querySelectorAll('.fade-in-up, .feature-card, .step').forEach(el => {
+            observer.observe(el);
+        });
+    </script>
+</body>
+</html>
