@@ -269,11 +269,12 @@ def search_phone_from_organic(store_name, location_hint, api_key):
         phone_patterns = [
             r'0120-\d{3}-\d{3}',
             r'0800-\d{3}-\d{4}',
-            r'0\d{1,3}-\d{2,4}-\d{3,4}',
-            r'\(\d{2,4}\)\d{3,4}-\d{3,4}',
+            r'0\d{1,4}-?\d{1,4}-?\d{3,4}',
+            r'\(\d{2,4}\)\s?\d{2,4}-?\d{3,4}',
         ]
         for r in results.get("organic_results", []):
             snippet = r.get("snippet", "")
+            snippet = unicodedata.normalize('NFKC', snippet)
             for pattern in phone_patterns:
                 match = re.search(pattern, snippet)
                 if match:
@@ -332,15 +333,15 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
             # --- 電話番号が一覧情報にない場合、詳細検索で再取得 ---
             if not phone:
                 place_id = place.get('place_id')
-                data_id = place.get('data_id')
+                data_cid = place.get('data_cid')
                 # どちらかがあれば詳細検索を行う
                 detail_id = None
                 detail_type = None
                 if place_id:
                     detail_id = place_id
                     detail_type = "place"
-                elif data_id:
-                    detail_id = data_id
+                elif data_cid:
+                    detail_id = data_cid
                     detail_type = "place"
                     
                 if detail_id:
@@ -357,9 +358,9 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                         if detail_type == "place" and place_id:
                             del detail_params["q"]
                             detail_params["place_id"] = place_id
-                        elif data_id:
+                        elif data_cid:
                             del detail_params["q"]
-                            detail_params["data_id"] = data_id
+                            detail_params["data_cid"] = data_cid
 
                         detail_search = GoogleSearch(detail_params)
                         detail_results = detail_search.get_dict()
@@ -397,6 +398,7 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
             return best_place
 
         # ===== クエリバリエーションを順番に試す =====
+        best_place_without_phone = None
         for variant in name_variants:
             results, query_used = _do_search(variant)
 
@@ -406,8 +408,12 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                 place = _best_from_local(local_results, query_used)
                 if place is not None:
                     result = _extract_place(place, query_used)
-                    set_cached_result(store_name, location_str, location_hint, result)
-                    return result
+                    if result.get('電話番号'):
+                        set_cached_result(store_name, location_str, location_hint, result)
+                        return result
+                    else:
+                        if not best_place_without_phone:
+                            best_place_without_phone = result
 
             # --- ② place_results（直接マッチ）から取得 ---
             if results and 'place_results' in results:
@@ -417,20 +423,34 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                 ratio = fuzzy_score(title, base_name)
                 if ratio >= 0.5:  # 50%以上の類似度があれば採用
                     result = _extract_place(place, query_used)
-                    set_cached_result(store_name, location_str, location_hint, result)
-                    return result
+                    if result.get('電話番号'):
+                        set_cached_result(store_name, location_str, location_hint, result)
+                        return result
+                    else:
+                        if not best_place_without_phone:
+                            best_place_without_phone = result
 
         # フォールバック: organic検索・ナレッジグラフ
         phone_from_organic = search_phone_from_organic(store_name, location_hint, api_key)
         if phone_from_organic:
-            result = {
-                'success': True,
-                '店舗名': store_name, '電話番号': phone_from_organic,
-                '住所': '', '緯度': None, '経度': None,
-                '評価': '', 'レビュー数': '', '信頼度': 'Mid'
-            }
-            set_cached_result(store_name, location_str, location_hint, result)
-            return result
+            if best_place_without_phone:
+                best_place_without_phone['電話番号'] = phone_from_organic
+                best_place_without_phone['信頼度'] = calculate_confidence(best_place_without_phone)
+                set_cached_result(store_name, location_str, location_hint, best_place_without_phone)
+                return best_place_without_phone
+            else:
+                result = {
+                    'success': True,
+                    '店舗名': store_name, '電話番号': phone_from_organic,
+                    '住所': '', '緯度': None, '経度': None,
+                    '評価': '', 'レビュー数': '', '信頼度': 'Mid'
+                }
+                set_cached_result(store_name, location_str, location_hint, result)
+                return result
+
+        if best_place_without_phone:
+            set_cached_result(store_name, location_str, location_hint, best_place_without_phone)
+            return best_place_without_phone
 
         result = {**EMPTY, 'error': '店舗が見つかりませんでした'}
         set_cached_result(store_name, location_str, location_hint, result)
@@ -444,16 +464,15 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
 # 並列検索ワーカー（ThreadPoolExecutor）
 # ============================================================
 def _search_worker(args):
-    idx, store_name, location_str, api_key, location_hint = args
+    row_idx, store_name, location_str, api_key, location_hint = args
     result = search_store_by_name(store_name, location_str, api_key, location_hint)
-    return idx, store_name, result
+    return row_idx, store_name, result
 
 
 def parallel_search_stores(
-    store_names: list,
+    targets: list,
     location_str: Optional[str],
     api_key: str,
-    location_hint: Optional[str],
     max_workers: int = 5,
     progress_callback=None,
 ) -> list:
@@ -461,20 +480,20 @@ def parallel_search_stores(
     店舗リストを並列検索する。
     SerpAPI の利用規約・レートリミットを考慮し max_workers=5 をデフォルトに設定。
     """
-    total = len(store_names)
-    results = [None] * total
+    total = len(targets)
+    results = []
 
     tasks = [
-        (i, name, location_str, api_key, location_hint)
-        for i, name in enumerate(store_names)
+        (row_idx, name, location_str, api_key, addr_hint)
+        for row_idx, name, addr_hint in targets
     ]
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_search_worker, task): task[0] for task in tasks}
         completed = 0
         for future in as_completed(futures):
-            idx, store_name, result = future.result()
-            results[idx] = (store_name, result)
+            row_idx, store_name, result = future.result()
+            results.append((row_idx, store_name, result))
             completed += 1
             if progress_callback:
                 progress_callback(completed, total, store_name)
@@ -565,6 +584,31 @@ with st.sidebar:
 
 
 # ============================================================
+# ファイル名・地域ジャンル自動抽出用ヘルパー
+# ============================================================
+def extract_prefecture_city(address_series):
+    """address列から最初の有効な住所を解析し、都道府県・市区町村を返す"""
+    for addr in address_series.dropna().astype(str):
+        addr = addr.strip()
+        # 全角スペースや半角スペースで区切られている場合のトリミング
+        addr = re.sub(r'[\s\u3000]+', ' ', addr)
+        # 都道府県・市区町村を抽出する正規表現
+        match = re.match(r'^(東京都|大阪府|京都府|北海道|[^都道府県]{2,3}県)\s?([^市区町村]{1,5}[市区町村])', addr)
+        if match:
+            return f"{match.group(1)}{match.group(2)}"
+    return ""
+
+
+def extract_genre_from_filename(filename):
+    """アップロードされたファイル名からジャンルを推測する"""
+    keywords = ['カフェ', 'スイーツ', '居酒屋', 'ラーメン', '焼肉', '寿司', 'イタリアン', 'フレンチ', '和食', '中華', 'レストラン', '美容室', 'クリニック', '歯科', 'サロン', 'バー', '洋食']
+    for kw in keywords:
+        if kw in filename:
+            return kw
+    return ""
+
+
+# ============================================================
 # メイン画面：CSV抽出専用UI
 # ============================================================
 st.title("📞 店舗電話番号抽出ツール")
@@ -615,12 +659,23 @@ if uploaded_file is not None:
             help="既に電話番号が入っている行をスキップしたい場合に選択してください"
         )
 
+        auto_detected_addr = next(
+            (col for col in columns if any(kw in col.lower() for kw in ['住所', 'address', '所在', '地域', '場所'])),
+            None
+        )
+        address_col_input = st.selectbox(
+            "住所・エリアの列を選択（推奨）",
+            ["指定なし"] + columns,
+            index=columns.index(auto_detected_addr) + 1 if auto_detected_addr else 0,
+            help="行ごとの住所を指定すると、同名他社の誤取得を防ぎ、正確に店舗を特定できます。"
+        )
+
         st.markdown("#### 📍 共通検索条件（任意）")
         col_cond1, col_cond2 = st.columns(2)
 
         with col_cond1:
-            location_name = st.text_input("地名（任意）", placeholder="例: 東京都渋谷区",
-                                          help="地名を指定すると、その地域で検索します")
+            location_name = st.text_input("地名（任意・住所列がない場合）", placeholder="例: 東京都渋谷区",
+                                          help="住所の列がない場合、こちらに入力した地域で検索します")
 
         with col_cond2:
             use_radius_csv = st.checkbox("検索半径を指定", help="指定した半径内の店舗のみを取得します")
@@ -639,16 +694,28 @@ if uploaded_file is not None:
             with col_coord2:
                 center_lon_csv = st.number_input("経度", value=139.6503, format="%.7f")
 
+        st.markdown("#### 📁 出力ファイル名設定")
+        col_fn1, col_fn2 = st.columns(2)
+
+        detected_pref_city = ""
+        if address_col_input != "指定なし":
+            detected_pref_city = extract_prefecture_city(df_uploaded[address_col_input])
+
+        detected_genre = extract_genre_from_filename(uploaded_file.name)
+
+        with col_fn1:
+            pref_city_input = st.text_input("エリア（ファイル名用）", value=detected_pref_city, placeholder="例: 埼玉県さいたま市")
+        with col_fn2:
+            genre_input = st.text_input("ジャンル（ファイル名用）", value=detected_genre, placeholder="例: カフェ")
+
         # --- ③ 実行 ---
         st.markdown("### 🚀 ③ 実行")
         if st.button("🔍 電話番号を取得", type="primary", use_container_width=True):
             if store_name_col not in df_uploaded.columns:
                 st.error("❌ 選択した列が存在しません")
             else:
-                store_names = df_uploaded[store_name_col].dropna().astype(str).tolist()
-
-                if not store_names:
-                    st.warning("⚠️ 屋号が含まれていません")
+                if not api_key:
+                    st.error("❌ SerpAPIキーが設定されていません。サイドバーから設定してください。")
                 else:
                     # --- 既存の電話番号がある行をスキップする判定 ---
                     search_targets = []
@@ -657,12 +724,33 @@ if uploaded_file is not None:
                     seen_input_names_pre = {}
                     
                     for i, row in df_uploaded.iterrows():
-                        name = str(row[store_name_col])
-                        if pd.isna(row[store_name_col]) or name.strip() == "":
+                        name = str(row[store_name_col]) if not pd.isna(row[store_name_col]) else ""
+                        if name.strip() == "":
+                            # 空欄行のダミー結果
+                            simulated_result = {
+                                'success': False,
+                                '店舗名': '',
+                                '電話番号': '',
+                                '住所': '',
+                                '緯度': None,
+                                '経度': None,
+                                '評価': '',
+                                'レビュー数': '',
+                                '信頼度': 'Low',
+                                'error': '屋号空欄',
+                                'is_empty': True
+                            }
+                            skipped_duplicate_inputs.append((i, "", simulated_result))
                             continue
                             
+                        # 行ごとの住所をヒントに設定
+                        addr_hint = None
+                        if address_col_input != "指定なし" and not pd.isna(row[address_col_input]):
+                            addr_hint = str(row[address_col_input]).strip()
+
                         # APIリクエスト前に重複をチェックし、クレジット消費を防ぐ
-                        name_key = name.strip()
+                        # 屋号と住所の組み合わせでユニークキーを作ることで、同名異店舗をスキップしないようにする！
+                        name_key = f"{name.strip()}|{addr_hint or ''}"
                         if name_key in seen_input_names_pre:
                             simulated_result = {
                                 'success': False,
@@ -674,22 +762,23 @@ if uploaded_file is not None:
                                 '評価': '',
                                 'レビュー数': '',
                                 '信頼度': 'Low',
-                                'error': '入力値の重複（APIリクエストスキップ）',
+                                'error': '入力値の重複',
                                 'is_duplicate_input': True
                             }
-                            skipped_duplicate_inputs.append((name, simulated_result))
+                            skipped_duplicate_inputs.append((i, name, simulated_result))
                             continue
                             
                         seen_input_names_pre[name_key] = i
                             
                         has_phone = False
-                        if phone_col_input != "指定なし":
+                        if phone_col_input != "指定なし" and not pd.isna(row[phone_col_input]):
                             val = str(row[phone_col_input]).strip()
-                            if val and val.lower() not in ["nan", "none"]:
+                            digits_only = re.sub(r'\D', '', val)
+                            if len(digits_only) in [10, 11]:
                                 has_phone = True
                         
                         if has_phone:
-                            # 既に電話番号がある場合は、検索結果をシミュレート
+                            # 既に10-11桁の正しい電話番号がある場合は、検索結果をシミュレートしてスキップ
                             simulated_result = {
                                 'success': True,
                                 '店舗名': name,
@@ -702,14 +791,14 @@ if uploaded_file is not None:
                                 '信頼度': 'Existing',
                                 'is_existing': True
                             }
-                            skipped_already_has_phone.append((name, simulated_result))
+                            skipped_already_has_phone.append((i, name, simulated_result))
                         else:
-                            search_targets.append(name)
+                            search_targets.append((i, name, addr_hint))
 
-                    if not search_targets and not skipped_already_has_phone:
+                    if not search_targets and not skipped_already_has_phone and not skipped_duplicate_inputs:
                         st.warning("⚠️ 検索対象の店舗がありません")
                     else:
-                        # 座標取得
+                        # 座標取得（グローバルなlocation_nameがある場合）
                         location_str_csv = None
                         if location_name:
                             with st.spinner(f"「{location_name}」の座標を取得しています..."):
@@ -735,16 +824,13 @@ if uploaded_file is not None:
 
                             def update_progress(completed, total, current_name):
                                 progress_bar.progress(completed / total)
-                                cached = get_cached_result(current_name, location_str_csv, location_name or None)
-                                cache_tag = " ⚡キャッシュ" if cached else ""
-                                status_text.text(f"完了: {completed}/{total} - {current_name}{cache_tag}")
+                                status_text.text(f"完了: {completed}/{total} - {current_name}")
 
                             start_time = time.time()
                             parallel_results = parallel_search_stores(
-                                store_names=search_targets,
+                                targets=search_targets,
                                 location_str=location_str_csv,
                                 api_key=api_key,
-                                location_hint=location_name or None,
                                 max_workers=max_workers,
                                 progress_callback=update_progress,
                             )
@@ -756,154 +842,180 @@ if uploaded_file is not None:
                             st.info("💡 全ての行に既に電話番号が入っているため、新規検索をスキップしました。")
 
                         # 結果の統合（新規検索結果 + 既存スキップ分 + 重複スキップ分）
-                        # 順序を維持するために、元のdfのインデックス順に並べ直すのが理想だが、
-                        # 現状のロジックでは parallel_results をそのまま使っているので、一旦結合する。
                         all_final_results = parallel_results + skipped_already_has_phone + skipped_duplicate_inputs
+                        # 元のCSVの行順に完全に並べ直す
+                        all_final_results.sort(key=lambda x: x[0])
 
                     # ============================================================
-                    # 結果整形 ＋ 重複検出
+                    # 結果整形（元のCSVに右側に列を追加）
                     # ============================================================
-                    results_list = []
-                    skipped_list = []
-                    seen_input_names = {}
+                    df_output = df_uploaded.copy()
+                    
+                    new_phones = []
+                    new_store_names = []
+                    new_addresses = []
+                    new_confidences = []
+                    error_reasons = []
+
                     seen_result_keys = {}
+                    skipped_list = [] # 重複表示用タブのためのリスト
 
-                    for row_idx, (store_name, result) in enumerate(all_final_results):
-                        row_result = {
-                            '屋号（入力値）': store_name,
-                            '取得店舗名': result.get('店舗名', ''),
-                            '電話番号': result.get('電話番号', ''),
-                            '住所': result.get('住所', ''),
-                            '緯度': result.get('緯度', ''),
-                            '経度': result.get('経度', ''),
-                            '評価': result.get('評価', ''),
-                            'レビュー数': result.get('レビュー数', ''),
-                            '信頼度': result.get('信頼度', 'Low'),
-                            'エラー': result.get('error', '') if not result.get('success', False) else ''
-                        }
+                    for row_idx, store_name, result in all_final_results:
+                        phone_val = (result.get('電話番号') or '').strip()
+                        address_val = (result.get('住所') or '').strip()
+                        result_key = (phone_val, address_val)
 
-                        # 半径フィルタ
+                        err_reason = ''
+                        err = result.get('error', '')
+                        
+                        # 半径フィルタの適用
                         if use_radius_csv and radius_meters_csv and center_lat_csv and center_lon_csv:
                             lat = result.get('緯度')
                             lon = result.get('経度')
                             if lat and lon:
                                 distance = calculate_distance(center_lat_csv, center_lon_csv, lat, lon)
-                                row_result['距離（m）'] = f"{distance:.0f}"
                                 if distance > radius_meters_csv:
-                                    row_result['取得店舗名'] = ''
-                                    row_result['電話番号'] = ''
-                                    row_result['住所'] = ''
-                                    row_result['エラー'] = f'半径{radius_meters_csv}mを超えています'
-                            else:
-                                row_result['距離（m）'] = ''
-                        else:
-                            row_result['距離（m）'] = ''
+                                    phone_val = ''
+                                    err_reason = f'指定の半径{radius_meters_csv}mを超えています'
 
-                        # 重複①: 入力店舗名の重複チェック
-                        name_key = store_name.strip()
-                        if name_key in seen_input_names:
-                            skipped_row = {**row_result, '重複理由': f'入力値の重複（{seen_input_names[name_key]+1}行目と同じ屋号）'}
-                            skipped_list.append(skipped_row)
-                            continue
-                        seen_input_names[name_key] = row_idx
-
-                        # 重複②: 取得結果（電話番号＋住所）の重複チェック
-                        phone_val = (row_result.get('電話番号') or '').strip()
-                        address_val = (row_result.get('住所') or '').strip()
-                        result_key = (phone_val, address_val)
-
-                        if (phone_val or address_val) and result_key in seen_result_keys:
-                            skipped_row = {**row_result, '重複理由': f'取得結果の重複（「{seen_result_keys[result_key]}」と同一店舗）'}
-                            skipped_list.append(skipped_row)
-                            continue
+                        # 重複判定
+                        is_dup = False
+                        if result.get('is_duplicate_input'):
+                            err_reason = '入力値の重複（他行で検索したためリクエスト省略）'
+                            is_dup = True
+                        elif result.get('is_empty'):
+                            err_reason = '店名（屋号）空欄のためスキップ'
+                            is_dup = True
+                        elif (phone_val or address_val) and result_key in seen_result_keys:
+                            err_reason = f"取得結果の重複（「{seen_result_keys[result_key]}」と同一店舗）"
+                            is_dup = True
+                        
                         if phone_val or address_val:
                             seen_result_keys[result_key] = store_name
 
-                        results_list.append(row_result)
+                        if is_dup:
+                            # 重複タブに表示するために記録
+                            skipped_list.append({
+                                '行番号': row_idx + 1,
+                                '屋号（入力値）': store_name,
+                                '取得店舗名': result.get('店舗名', ''),
+                                '電話番号': phone_val,
+                                '住所': address_val,
+                                '重複理由': err_reason
+                            })
+
+                        if not err_reason:
+                            if not result.get('success', False):
+                                if '店舗が見つかりませんでした' in err:
+                                    err_reason = 'Googleマップ上に店舗が見つかりませんでした'
+                                elif 'APIキー' in err:
+                                    err_reason = 'SerpAPIキーの設定エラー'
+                                else:
+                                    err_reason = f'未取得 ({err})'
+                            else:
+                                if not phone_val:
+                                    err_reason = '店舗は見つかりましたが、電話番号の掲載がありませんでした'
+                                else:
+                                    err_reason = '正常取得' if not result.get('is_existing') else '既存（スキップ）'
+
+                        new_phones.append(phone_val)
+                        new_store_names.append(result.get('店舗名', ''))
+                        new_addresses.append(address_val)
+                        new_confidences.append(result.get('信頼度', 'Low') if not result.get('is_existing') else 'Existing')
+                        error_reasons.append(err_reason)
+
+                    # DataFrameにカラムを結合
+                    df_output['補完_Google掲載電話番号'] = new_phones
+                    df_output['補完_取得店舗名'] = new_store_names
+                    df_output['補完_取得住所'] = new_addresses
+                    df_output['補完_信頼度'] = new_confidences
+                    df_output['補完_エラー原因'] = error_reasons
 
                     # --- ④ 結果表示 ---
                     st.markdown("### 📊 ④ 結果")
 
-                    if results_list or skipped_list:
-                        df_results = pd.DataFrame(results_list) if results_list else pd.DataFrame()
-                        df_skipped = pd.DataFrame(skipped_list) if skipped_list else pd.DataFrame()
-                        per_store = elapsed / len(store_names) if store_names else 0
+                    df_skipped = pd.DataFrame(skipped_list) if skipped_list else pd.DataFrame()
+                    existing_skip_count = len(skipped_already_has_phone)
+                    new_acquire_count = sum(1 for r in all_final_results if r[2].get('success') and not r[2].get('is_existing') and r[2].get('電話番号') and not r[2].get('is_duplicate_input'))
+                    
+                    st.success(
+                        f"✅ 処理完了：新規取得 **{new_acquire_count}件** ／ 既存スキップ **{existing_skip_count}件** ／ 重複スキップ **{len(skipped_list)}件**"
+                        f"　⏱️ 所要時間: {elapsed:.1f}秒"
+                    )
 
-                        existing_skip_count = len(skipped_already_has_phone)
-                        st.success(
-                            f"✅ 処理完了：新規取得 **{len(results_list) - existing_skip_count}件** ／ 既存スキップ **{existing_skip_count}件** ／ 重複スキップ **{len(skipped_list)}件**"
-                            f"　⏱️ 所要時間: {elapsed:.1f}秒"
+                    tab_result1, tab_result2, tab_result3, tab_result4 = st.tabs([
+                        "📊 テーブル表示",
+                        "📋 リスト表示",
+                        f"⚠️ 重複・スキップ（{len(skipped_list)}件）",
+                        "📥 CSVダウンロード"
+                    ])
+
+                    with tab_result1:
+                        st.markdown(f"**全レコード数: {len(df_output)}件**")
+                        st.dataframe(df_output, use_container_width=True, hide_index=True)
+
+                    with tab_result2:
+                        for index, (store_name, result) in enumerate([(r[1], r[2]) for r in all_final_results], 1):
+                            with st.container():
+                                st.markdown(f"### {index}. {store_name}")
+                                if result.get('店舗名'):
+                                    st.markdown(f"**取得店舗名:** {result['店舗名']}")
+                                if result.get('電話番号'):
+                                    st.markdown(f"📞 **電話番号:** {result['電話番号']}")
+                                if result.get('住所'):
+                                    st.markdown(f"📍 **住所:** {result['住所']}")
+                                confidence_emoji = {
+                                    'Very High': '🟢', 
+                                    'High': '🟡', 
+                                    'Mid': '🟠', 
+                                    'Low': '🔴',
+                                    'Existing': '🔵'
+                                }.get(result.get('信頼度', 'Low'), '⚪')
+                                st.markdown(f"{confidence_emoji} **信頼度:** {result.get('信頼度', 'Low')}")
+                                if result.get('error'):
+                                    st.warning(f"⚠️ {result['error']}")
+                                st.divider()
+
+                    with tab_result3:
+                        if not df_skipped.empty:
+                            st.markdown(f"**重複・スキップされた店舗: {len(skipped_list)}件**")
+                            st.caption(
+                                "重複理由が「入力値の重複」→ CSVに同じ屋号が複数行あるためAPI利用を省略した行。"
+                                "「取得結果の重複」→ 別の屋号だが同じ店舗（電話番号・住所が一致）として検出された行。"
+                            )
+                            st.dataframe(df_skipped, use_container_width=True, hide_index=True)
+                            csv_skipped = df_skipped.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button(
+                                label="📥 重複・スキップ一覧をCSVでダウンロード",
+                                data=csv_skipped,
+                                file_name=f"skipped_duplicates_{len(skipped_list)}件.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
+                        else:
+                            st.success("✅ 重複した店舗は見つかりませんでした")
+
+                    with tab_result4:
+                        st.markdown("### CSVファイルをダウンロード")
+                        csv_output = df_output.to_csv(index=False, encoding='utf-8-sig')
+                        
+                        # ファイル名の決定
+                        fn_parts = []
+                        if pref_city_input.strip():
+                            fn_parts.append(pref_city_input.strip())
+                        if genre_input.strip():
+                            fn_parts.append(genre_input.strip())
+                        fn_parts.append("電話番号補完結果")
+                        filename = f"{'_'.join(fn_parts)}.csv"
+
+                        st.download_button(
+                            label="📥 補完結果をCSVでダウンロード",
+                            data=csv_output,
+                            file_name=filename,
+                            mime="text/csv",
+                            use_container_width=True
                         )
-
-                        tab_result1, tab_result2, tab_result3, tab_result4 = st.tabs([
-                            "📊 テーブル表示",
-                            "📋 リスト表示",
-                            f"⚠️ 重複スキップ（{len(skipped_list)}件）",
-                            "📥 CSVダウンロード"
-                        ])
-
-                        with tab_result1:
-                            st.markdown(f"**取得件数: {len(results_list)}件**")
-                            if not df_results.empty:
-                                st.dataframe(df_results, use_container_width=True, hide_index=True)
-                            else:
-                                st.info("取得結果がありません")
-
-                        with tab_result2:
-                            for index, row in enumerate(results_list, 1):
-                                with st.container():
-                                    st.markdown(f"### {index}. {row['屋号（入力値）']}")
-                                    if row['取得店舗名']:
-                                        st.markdown(f"**取得店舗名:** {row['取得店舗名']}")
-                                    if row['電話番号']:
-                                        st.markdown(f"📞 **電話番号:** {row['電話番号']}")
-                                    if row['住所']:
-                                        st.markdown(f"📍 **住所:** {row['住所']}")
-                                    if row.get('距離（m）'):
-                                        st.markdown(f"📏 **距離:** {row['距離（m）']}m")
-                                    confidence_emoji = {
-                                        'Very High': '🟢', 
-                                        'High': '🟡', 
-                                        'Mid': '🟠', 
-                                        'Low': '🔴',
-                                        'Existing': '🔵'
-                                    }.get(row.get('信頼度', 'Low'), '⚪')
-                                    st.markdown(f"{confidence_emoji} **信頼度:** {row.get('信頼度', 'Low')}")
-                                    if row['エラー']:
-                                        st.warning(f"⚠️ {row['エラー']}")
-                                    st.divider()
-
-                        with tab_result3:
-                            if not df_skipped.empty:
-                                st.markdown(f"**重複としてスキップされた店舗: {len(skipped_list)}件**")
-                                st.caption(
-                                    "重複理由が「入力値の重複」→ CSVに同じ屋号が複数行ある。"
-                                    "　「取得結果の重複」→ 別の屋号だが同じ店舗（電話番号・住所が一致）として検出。"
-                                )
-                                st.dataframe(df_skipped, use_container_width=True, hide_index=True)
-                                csv_skipped = df_skipped.to_csv(index=False, encoding='utf-8-sig')
-                                st.download_button(
-                                    label="📥 重複スキップ一覧をCSVでダウンロード",
-                                    data=csv_skipped,
-                                    file_name=f"skipped_duplicates_{len(skipped_list)}件.csv",
-                                    mime="text/csv",
-                                    use_container_width=True
-                                )
-                            else:
-                                st.success("✅ 重複した店舗は見つかりませんでした")
-
-                        with tab_result4:
-                            st.markdown("### CSVファイルをダウンロード")
-                            if not df_results.empty:
-                                csv_output = df_results.to_csv(index=False, encoding='utf-8-sig')
-                                st.download_button(
-                                    label="📥 取得結果をCSVでダウンロード",
-                                    data=csv_output,
-                                    file_name=f"phone_numbers_from_csv_{len(results_list)}件.csv",
-                                    mime="text/csv",
-                                    use_container_width=True
-                                )
-                                st.dataframe(df_results, use_container_width=True, hide_index=True)
+                        st.dataframe(df_output, use_container_width=True, hide_index=True)
 
     except Exception as e:
         st.error(f"❌ エラーが発生しました: {str(e)}")
