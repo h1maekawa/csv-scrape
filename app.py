@@ -229,18 +229,43 @@ def calculate_confidence(result):
 # ============================================================
 # Organic検索フォールバック
 # ============================================================
-def search_phone_from_organic(store_name, api_key):
-    """Google organic検索から電話番号を取得（フォールバック用）"""
+def search_phone_from_organic(store_name, location_hint, api_key):
+    """Google organic検索・ナレッジグラフから電話番号を取得（フォールバック用）"""
     try:
+        query = f"{store_name} 電話番号"
+        if location_hint:
+            query = f"{store_name} {location_hint} 電話番号"
+
         params = {
             "engine": "google",
-            "q": f"{store_name} 公式 電話番号",
+            "q": query,
             "api_key": api_key,
-            "num": 5
+            "num": 3,
+            "hl": "ja",
+            "gl": "jp"
         }
         search = GoogleSearch(params)
         results = search.get_dict()
 
+        # 1. ナレッジグラフ（店舗詳細パネル）から取得
+        kg = results.get("knowledge_graph", {})
+        if kg.get("phone"):
+            return kg.get("phone")
+        elif kg.get("formatted_phone_number"):
+            return kg.get("formatted_phone_number")
+        
+        # ローカル結果（マップ結果）から取得
+        local_results = results.get("local_results", {})
+        if isinstance(local_results, list) and len(local_results) > 0:
+            first_local = local_results[0]
+            if first_local.get("phone"):
+                return first_local.get("phone")
+        elif isinstance(local_results, dict):
+            places = local_results.get("places", [])
+            if places and places[0].get("phone"):
+                return places[0].get("phone")
+
+        # 2. オーガニック検索のスニペットから正規表現で取得
         phone_patterns = [
             r'0120-\d{3}-\d{3}',
             r'0800-\d{3}-\d{4}',
@@ -302,10 +327,52 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
         def _extract_place(place, query):
             """placeオブジェクトから統一フォーマットのresultを生成"""
             gps = place.get('gps_coordinates', {})
+            phone = place.get('phone') or place.get('formatted_phone_number') or place.get('電話', '')
+            
+            # --- 電話番号が一覧情報にない場合、詳細検索で再取得 ---
+            if not phone:
+                place_id = place.get('place_id')
+                data_id = place.get('data_id')
+                # どちらかがあれば詳細検索を行う
+                detail_id = None
+                detail_type = None
+                if place_id:
+                    detail_id = place_id
+                    detail_type = "place"
+                elif data_id:
+                    detail_id = data_id
+                    detail_type = "place"
+                    
+                if detail_id:
+                    try:
+                        detail_params = {
+                            "engine": "google_maps",
+                            "q": detail_id,
+                            "type": detail_type,
+                            "api_key": api_key,
+                            "hl": "ja",
+                            "gl": "jp",
+                        }
+                        # SerpAPIの仕様で、place_idは q パラメータではなく place_id に渡すことが多い
+                        if detail_type == "place" and place_id:
+                            del detail_params["q"]
+                            detail_params["place_id"] = place_id
+                        elif data_id:
+                            del detail_params["q"]
+                            detail_params["data_id"] = data_id
+
+                        detail_search = GoogleSearch(detail_params)
+                        detail_results = detail_search.get_dict()
+                        if "place_results" in detail_results:
+                            detail_place = detail_results["place_results"]
+                            phone = detail_place.get('phone') or detail_place.get('formatted_phone_number') or detail_place.get('電話', '')
+                    except Exception:
+                        pass
+
             r = {
                 'success': True,
                 '店舗名': place.get('title', ''),
-                '電話番号': place.get('phone') or place.get('formatted_phone_number') or place.get('電話', ''),
+                '電話番号': phone,
                 '住所': place.get('address') or place.get('住所', ''),
                 '緯度': gps.get('latitude') if gps else None,
                 '経度': gps.get('longitude') if gps else None,
@@ -353,8 +420,8 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                     set_cached_result(store_name, location_str, location_hint, result)
                     return result
 
-        # フォールバック: organic検索
-        phone_from_organic = search_phone_from_organic(store_name, api_key)
+        # フォールバック: organic検索・ナレッジグラフ
+        phone_from_organic = search_phone_from_organic(store_name, location_hint, api_key)
         if phone_from_organic:
             result = {
                 'success': True,
