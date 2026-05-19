@@ -1,4 +1,6 @@
 import os
+import unicodedata
+import difflib
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -100,7 +102,63 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 
 
 # ============================================================
-# スコアリング（精度ロジック維持）
+# 表記正規化・ファジーマッチング
+# ============================================================
+def normalize_name(text: str) -> str:
+    """店名を正規化：全角→半角、スペース除去、記号除去、小文字化"""
+    if not text:
+        return ""
+    # 全角英数字・記号→半角
+    text = unicodedata.normalize('NFKC', text)
+    # スペース（全角・半角）除去
+    text = re.sub(r'[\s\u3000]+', '', text)
+    # 小文字化
+    text = text.lower()
+    # 記号除去（日本語・英数字・ひらがな・カタカナ・漢字のみ残す）
+    text = re.sub(r'[^\w\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]', '', text)
+    return text
+
+
+def fuzzy_score(a: str, b: str) -> float:
+    """2つの店名の類似度を0.0〜1.0で返す（正規化後に比較）"""
+    na, nb = normalize_name(a), normalize_name(b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def build_name_variants(store_name: str) -> list:
+    """検索に使うクエリのバリエーションを生成する"""
+    base = store_name.strip()
+    variants = [base]
+
+    # スペースをすべて除去したバージョン
+    no_space = re.sub(r'[\s\u3000]+', '', base)
+    if no_space != base:
+        variants.append(no_space)
+
+    # 「店」「支店」「本店」などのサフィックスを除いたバージョン
+    stripped = re.sub(r'[\s\u3000]*(\S+店|支店|本店|分店)$', '', base).strip()
+    if stripped and stripped != base:
+        variants.append(stripped)
+
+    # 全角→半角正規化バージョン
+    normalized = unicodedata.normalize('NFKC', base)
+    if normalized != base:
+        variants.append(normalized)
+
+    # 重複除去（順序維持）
+    seen = set()
+    result = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
+# ============================================================
+# スコアリング（ファジーマッチング対応）
 # ============================================================
 def score_place(place, query=""):
     score = 0
@@ -122,16 +180,28 @@ def score_place(place, query=""):
 
     if query:
         query_clean = query.strip()
+        # ① 完全一致
         if title == query_clean:
             score += 40
+        # ② 前方一致
         elif title.startswith(query_clean):
             score += 25
+        # ③ 部分一致
         elif query_clean in title:
             score += 15
         elif title in query_clean and len(title) >= 2:
             score += 10
         else:
-            score -= 20
+            # ④ ファジーマッチング（正規化後の類似度）
+            ratio = fuzzy_score(title, query_clean)
+            if ratio >= 0.85:
+                score += 35   # ほぼ一致
+            elif ratio >= 0.70:
+                score += 20   # かなり近い
+            elif ratio >= 0.55:
+                score += 8    # やや近い
+            else:
+                score -= 20   # 関係なさそう
 
     if any(x in title for x in ['閉店', '廃業', '跡地', '移転']):
         score -= 80
@@ -207,48 +277,81 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
         return {**EMPTY, 'error': 'APIキーが設定されていません'}
 
     try:
-        query = store_name.strip()
-        if location_hint and not location_str:
-            query = f"{query} {location_hint.strip()}"
+        base_name = store_name.strip()
+        # 検索クエリのバリエーションを生成
+        name_variants = build_name_variants(base_name)
 
-        params = {
-            "engine": "google_maps",
-            "q": query,
-            "api_key": api_key,
-            "type": "search",
-            "hl": "ja",
-            "gl": "jp",
-        }
-        if location_str:
-            params["ll"] = location_str
+        def _do_search(q_name):
+            """指定クエリでSerpAPI検索を実行し、結果dictを返す"""
+            query = q_name
+            if location_hint and not location_str:
+                query = f"{q_name} {location_hint.strip()}"
+            params = {
+                "engine": "google_maps",
+                "q": query,
+                "api_key": api_key,
+                "type": "search",
+                "hl": "ja",
+                "gl": "jp",
+            }
+            if location_str:
+                params["ll"] = location_str
+            search = GoogleSearch(params)
+            return search.get_dict(), query
 
-        search = GoogleSearch(params)
-        results = search.get_dict()
+        def _extract_place(place, query):
+            """placeオブジェクトから統一フォーマットのresultを生成"""
+            gps = place.get('gps_coordinates', {})
+            r = {
+                'success': True,
+                '店舗名': place.get('title', ''),
+                '電話番号': place.get('phone') or place.get('formatted_phone_number') or place.get('電話', ''),
+                '住所': place.get('address') or place.get('住所', ''),
+                '緯度': gps.get('latitude') if gps else None,
+                '経度': gps.get('longitude') if gps else None,
+                '評価': place.get('rating', ''),
+                'レビュー数': place.get('reviews', ''),
+            }
+            r['信頼度'] = calculate_confidence(r)
+            return r
 
-        if results and 'local_results' in results:
-            local_results = results.get('local_results', [])
-            if local_results:
-                if len(local_results) > 1:
-                    scored_places = [(p, score_place(p, query)) for p in local_results]
-                    scored_places.sort(key=lambda x: x[1], reverse=True)
-                    place = scored_places[0][0]
-                else:
-                    place = local_results[0]
+        def _best_from_local(local_results, query):
+            """local_resultsからファジーマッチングで最良の候補を選ぶ"""
+            if not local_results:
+                return None
+            scored = [(p, score_place(p, query)) for p in local_results]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            best_place, best_score = scored[0]
+            # ファジースコアが低すぎる場合（全く別の店）は除外
+            title = best_place.get('title', '')
+            ratio = fuzzy_score(title, base_name)
+            if best_score < -10 and ratio < 0.4:
+                return None
+            return best_place
 
-                gps = place.get('gps_coordinates', {})
-                result = {
-                    'success': True,
-                    '店舗名': place.get('title', ''),
-                    '電話番号': place.get('phone') or place.get('formatted_phone_number') or place.get('電話', ''),
-                    '住所': place.get('address') or place.get('住所', ''),
-                    '緯度': gps.get('latitude') if gps else None,
-                    '経度': gps.get('longitude') if gps else None,
-                    '評価': place.get('rating', ''),
-                    'レビュー数': place.get('reviews', ''),
-                }
-                result['信頼度'] = calculate_confidence(result)
-                set_cached_result(store_name, location_str, location_hint, result)
-                return result
+        # ===== クエリバリエーションを順番に試す =====
+        for variant in name_variants:
+            results, query_used = _do_search(variant)
+
+            # --- ① local_results（複数候補）から取得 ---
+            if results and 'local_results' in results:
+                local_results = results.get('local_results', [])
+                place = _best_from_local(local_results, query_used)
+                if place is not None:
+                    result = _extract_place(place, query_used)
+                    set_cached_result(store_name, location_str, location_hint, result)
+                    return result
+
+            # --- ② place_results（直接マッチ）から取得 ---
+            if results and 'place_results' in results:
+                place = results['place_results']
+                # ファジースコアで入力店名と十分近いか確認
+                title = place.get('title', '')
+                ratio = fuzzy_score(title, base_name)
+                if ratio >= 0.5:  # 50%以上の類似度があれば採用
+                    result = _extract_place(place, query_used)
+                    set_cached_result(store_name, location_str, location_hint, result)
+                    return result
 
         # フォールバック: organic検索
         phone_from_organic = search_phone_from_organic(store_name, api_key)
