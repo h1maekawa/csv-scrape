@@ -5,9 +5,6 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
-from geopy.geocoders import Nominatim
-from geopy.distance import geodesic
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 import time
 import re
 import hashlib
@@ -52,10 +49,6 @@ def set_cached_result(store_name, location_str, location_hint, result):
 def clear_cache():
     with _cache_lock:
         _search_cache.clear()
-
-def get_cache_count():
-    with _cache_lock:
-        return len(_search_cache)
 
 # ============================================================
 # 表記正規化・ファジーマッチング
@@ -106,21 +99,7 @@ def build_name_variants(store_name: str) -> list:
         after_shop = base_for_split.split('のお店')[-1].strip()
         if after_shop: variants.append(after_shop)
 
-    stripped = re.sub(r'[\s\u3000]*(\S+店|支店|本店|分店)$', '', base_for_split).strip()
-    if stripped and stripped != base:
-        variants.append(stripped)
-
-    no_space = re.sub(r'[\s\u3000]+', '', base_for_split)
-    if no_space != base:
-        variants.append(no_space)
-
-    seen = set()
-    result = []
-    for v in variants:
-        if v and v not in seen:
-            seen.add(v)
-            result.append(v)
-    return result
+    return [v for v in variants if v]
 
 def is_valid_match(hit_title: str, input_name: str, current_variant: str) -> bool:
     if not hit_title: return False
@@ -128,13 +107,12 @@ def is_valid_match(hit_title: str, input_name: str, current_variant: str) -> boo
     i_norm = normalize_name(input_name)
     v_norm = normalize_name(current_variant)
     
-    if not h_norm: return False
     if h_norm in i_norm or i_norm in h_norm: return True
     if v_norm and (v_norm in h_norm or h_norm in v_norm): return True
-    if fuzzy_score(hit_title, current_variant) >= 0.65: return True
-    if fuzzy_score(hit_title, input_name) >= 0.35: return True
+    if fuzzy_score(hit_title, current_variant) >= 0.55: return True
     return False
 
+# Helper function used by maps searching score
 def score_place(place, query=""):
     score = 0
     title = place.get('title', '')
@@ -149,47 +127,7 @@ def score_place(place, query=""):
     return score
 
 # ============================================================
-# Organic検索フォールバック
-# ============================================================
-def search_phone_from_organic(store_name, location_hint, api_key):
-    try:
-        variants = build_name_variants(store_name)
-        search_names = [store_name]
-        if len(variants) > 1: search_names.append(variants[1])
-
-        for s_name in search_names:
-            query = f"{s_name} 電話番号"
-            if location_hint: query = f"{s_name} {location_hint.strip()} 電話番号"
-
-            params = {"engine": "google", "q": query, "api_key": api_key, "num": 4, "hl": "ja", "gl": "jp"}
-            search = GoogleSearch(params)
-            results = search.get_dict()
-
-            kg = results.get("knowledge_graph", {})
-            if kg.get("phone"): return kg.get("phone")
-            if kg.get("formatted_phone_number"): return kg.get("formatted_phone_number")
-            
-            local_results = results.get("local_results", {})
-            if isinstance(local_results, list) and len(local_results) > 0:
-                if local_results[0].get("phone"): return local_results[0].get("phone")
-
-            phone_patterns = [
-                r'0120-\d{3}-\d{3}', r'0800-\d{3}-\d{4}',
-                r'0\d{1,3}-\d{2,4}-\d{3,4}', r'\(\d{2,4}\)\d{3,4}-\d{3,4}',
-            ]
-            for r in results.get("organic_results", []):
-                snippet = r.get("snippet", "")
-                if not snippet: continue
-                snippet_norm = unicodedata.normalize('NFKC', snippet)
-                for pattern in phone_patterns:
-                    match = re.search(pattern, snippet_norm)
-                    if match: return match.group()
-        return ""
-    except:
-        return ""
-
-# ============================================================
-# 店舗検索（ピンポイント詳細住所 ＆ 丸め住所の2重網羅ロジック）
+# 統合型・超執念深い店舗検索ロジック（Web検索ファースト）
 # ============================================================
 def search_store_by_name(store_name, location_str=None, api_key=None, location_hint=None):
     cached = get_cached_result(store_name, location_str, location_hint)
@@ -198,15 +136,84 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
     EMPTY = {
         'success': False, '店舗名': '', '電話番号': '', '住所': '',
         '緯度': None, '経度': None, '評価': '', 'レビュー数': '', '信頼度': 'Low',
-        'error': 'Googleマップに店舗が見つかりませんでした。'
+        'error': 'Google検索・マップともに店舗を特定できませんでした。'
     }
     if not api_key: return {**EMPTY, 'error': 'APIキーが設定されていません'}
 
     try:
         base_name = store_name.strip()
-        name_variants = build_name_variants(base_name)
         
-        # 広域用の丸め住所（市区町村まで）
+        # ------------------------------------------------------------
+        # ➔ ★第一段階: 最強 of 最強のGoogle Web検索（ナレッジグラフ）で一本釣り
+        # ------------------------------------------------------------
+        query_web = f"{base_name} {location_hint.strip()}" if location_hint else base_name
+        params_web = {
+            "engine": "google",
+            "q": query_web,
+            "api_key": api_key,
+            "hl": "ja",
+            "gl": "jp",
+            "num": 4
+        }
+        
+        search_web = GoogleSearch(params_web)
+        results_web = search_web.get_dict()
+        
+        # 1. ナレッジグラフ（右側の公式詳細パネル）の確認
+        kg = results_web.get("knowledge_graph", {})
+        if kg:
+            phone_kg = kg.get("phone") or kg.get("formatted_phone_number")
+            if phone_kg:
+                r = {
+                    'success': True, '店舗名': kg.get("title", base_name), '電話番号': phone_kg,
+                    '住所': kg.get("address") or location_hint or '',
+                    '緯度': None, '経度': None, '評価': kg.get("rating", ""), 'レビュー数': kg.get("reviews", ""),
+                    '信頼度': 'Very High'
+                }
+                set_cached_result(store_name, location_str, location_hint, r)
+                return r
+
+        # 2. ローカル結果（検索結果内のマップ枠）の確認
+        local_res = results_web.get("local_results", [])
+        if isinstance(local_res, list) and local_res:
+            for p in local_res:
+                if is_valid_match(p.get("title", ""), base_name, base_name):
+                    if p.get("phone"):
+                        gps = p.get("gps_coordinates", {})
+                        r = {
+                            'success': True, '店舗名': p.get("title", base_name), '電話番号': p.get("phone"),
+                            '住所': p.get("address") or '',
+                            '緯度': gps.get('latitude') if gps else None, '経度': gps.get('longitude') if gps else None,
+                            '評価': p.get("rating", ""), 'レビュー数': p.get("reviews", ""),
+                            '信頼度': 'High'
+                        }
+                        set_cached_result(store_name, location_str, location_hint, r)
+                        return r
+
+        # 3. Webサイトの紹介文（スニペット）からの正規表現抽出
+        phone_patterns = [
+            r'0120-\d{3}-\d{3}', r'0800-\d{3}-\d{4}',
+            r'0\d{1,3}-\d{2,4}-\d{3,4}', r'\(\d{2,4}\)\d{3,4}-\d{3,4}',
+        ]
+        for org in results_web.get("organic_results", []):
+            snippet = org.get("snippet", "")
+            if snippet:
+                snippet_norm = unicodedata.normalize('NFKC', snippet)
+                for pattern in phone_patterns:
+                    match = re.search(pattern, snippet_norm)
+                    if match:
+                        r = {
+                            'success': True, '店舗名': base_name, '電話番号': match.group(),
+                            '住所': location_hint or '', '緯度': None, '経度': None, '評価': '', 'レビュー数': '',
+                            '信頼度': 'Mid'
+                        }
+                        set_cached_result(store_name, location_str, location_hint, r)
+                        return r
+
+        # ------------------------------------------------------------
+        # ➔ ★第二段階: Webで全滅した場合のみ、従来のGoogle Maps深い探索を回す
+        # ------------------------------------------------------------
+        name_variants = build_name_variants(base_name)
         map_hint = ""
         if location_hint:
             m = re.search(r'^([^市区町村郡]+?[市区町村郡])', location_hint.strip())
@@ -214,54 +221,45 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
 
         last_backup_result = None
 
-        # 店名バリエーションのループ
         for variant in name_variants:
-            # ➔ ★ 超強化：詳細住所(番地)と丸め住所(市区町村)の両方のクエリを順番に試す
             address_patterns = []
-            if location_hint: address_patterns.append(location_hint.strip()) # パターン1: 番地まで詳細
-            if map_hint and map_hint != location_hint: address_patterns.append(map_hint) # パターン2: 市区町村まで
-            address_patterns.append("") # パターン3: 住所なし
+            if location_hint: address_patterns.append(location_hint.strip())
+            if map_hint and map_hint != location_hint: address_patterns.append(map_hint)
+            address_patterns.append("")
 
             for addr_pattern in address_patterns:
                 query = f"{variant} {addr_pattern}".strip() if addr_pattern else variant
+                params_maps = {"engine": "google_maps", "q": query, "api_key": api_key, "type": "search", "hl": "ja", "gl": "jp"}
                 
-                params = {"engine": "google_maps", "q": query, "api_key": api_key, "type": "search", "hl": "ja", "gl": "jp"}
-                if location_str: params["ll"] = location_str
-                    
-                search = GoogleSearch(params)
-                results = search.get_dict()
+                search_maps = GoogleSearch(params_maps)
+                results_maps = search_maps.get_dict()
 
                 place = None
-                if results and 'local_results' in results:
-                    local_results = results.get('local_results', [])
+                if results_maps and 'local_results' in results_maps:
                     scored = []
-                    for p in local_results:
+                    for p in results_maps.get('local_results', []):
                         if is_valid_match(p.get('title', ''), base_name, variant):
                             scored.append((p, score_place(p, query)))
                     scored.sort(key=lambda x: x[1], reverse=True)
                     if scored: place = scored[0][0]
-
-                elif results and 'place_results' in results:
-                    p_res = results['place_results']
-                    if is_valid_match(p_res.get('title', ''), base_name, variant): place = p_res
+                elif results_maps and 'place_results' in results_maps:
+                    if is_valid_match(results_maps['place_results'].get('title', ''), base_name, variant):
+                        place = results_maps['place_results']
 
                 if place is not None:
                     gps = place.get('gps_coordinates', {})
                     phone = place.get('phone') or place.get('formatted_phone_number') or place.get('電話', '')
                     
-                    if not phone:
-                        place_id = place.get('place_id')
-                        data_cid = place.get('data_cid')
-                        if place_id or data_cid:
-                            try:
-                                detail_params = {"engine": "google_maps", "api_key": api_key, "hl": "ja", "gl": "jp"}
-                                if place_id: detail_params["place_id"] = place_id
-                                else: detail_params["data_cid"] = data_cid
-                                detail_results = GoogleSearch(detail_params).get_dict()
-                                if "place_results" in detail_results:
-                                    dp = detail_results["place_results"]
-                                    phone = dp.get('phone') or dp.get('formatted_phone_number') or dp.get('電話', '')
-                            except: pass
+                    if not phone and (place.get('place_id') or place.get('data_cid')):
+                        try:
+                            detail_params = {"engine": "google_maps", "api_key": api_key, "hl": "ja", "gl": "jp"}
+                            if place.get('place_id'): detail_params["place_id"] = place.get('place_id')
+                            else: detail_params["data_cid"] = place.get('data_cid')
+                            detail_results = GoogleSearch(detail_params).get_dict()
+                            if "place_results" in detail_results:
+                                dp = detail_results["place_results"]
+                                phone = dp.get('phone') or dp.get('formatted_phone_number') or dp.get('電話', '')
+                        except: pass
 
                     r = {
                         'success': True, '店舗名': place.get('title', store_name), '電話番号': phone,
@@ -269,29 +267,15 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                         '緯度': gps.get('latitude') if gps else None, '経度': gps.get('longitude') if gps else None,
                         '評価': place.get('rating', ''), 'レビュー数': place.get('reviews', ''),
                     }
-                    r['信頼度'] = 'Very High' if phone and r['住所'] else 'High'
-
+                    r['信頼度'] = 'High'
                     if phone:
                         set_cached_result(store_name, location_str, location_hint, r)
                         return r
                     else:
                         if not last_backup_result: last_backup_result = r
 
-        # フォールバック処理
-        phone_from_organic = search_phone_from_organic(store_name, location_hint, api_key)
-        if phone_from_organic:
-            final_r = {
-                'success': True, '店舗名': last_backup_result['店舗名'] if last_backup_result else store_name,
-                '電話番号': phone_from_organic, '住所': last_backup_result['住所'] if last_backup_result else '',
-                '緯度': last_backup_result['緯度'] if last_backup_result else None, '経度': last_backup_result['経度'] if last_backup_result else None,
-                '評価': last_backup_result['評価'] if last_backup_result else '', 'レビュー数': last_backup_result['レビュー数'] if last_backup_result else '',
-                '信頼度': 'Mid'
-            }
-            set_cached_result(store_name, location_str, location_hint, final_r)
-            return final_r
-
         if last_backup_result:
-            last_backup_result['error'] = '店舗は見つかりましたが、Googleマップ上に電話番号の掲載がありませんでした。'
+            last_backup_result['error'] = '店舗は見つかりましたが、Google上に電話番号の掲載がありませんでした。'
             set_cached_result(store_name, location_str, location_hint, last_backup_result)
             return last_backup_result
 
@@ -309,8 +293,6 @@ def _search_worker_csv(task_args):
 # UI構築（Streamlit）
 # ============================================================
 st.sidebar.header("⚙️ 設定")
-if 'api_key' not in st.session_state: st.session_state.api_key = ""
-
 new_api_key = st.sidebar.text_input("SerpAPI キーを入力", value=st.session_state.api_key, type="password")
 if new_api_key != st.session_state.api_key:
     st.session_state.api_key = new_api_key
@@ -328,7 +310,6 @@ if uploaded_file is not None:
     try:
         df_uploaded = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
         st.success(f"✅ ファイルを読み込みました（{len(df_uploaded)}行）")
-        st.dataframe(df_uploaded.head(3), use_container_width=True)
 
         columns = df_uploaded.columns.tolist()
         auto_name = next((c for c in columns if any(k in c.lower() for k in ['店名', '屋号', '名前', 'name', '店舗名'])), columns[0])
@@ -341,8 +322,8 @@ if uploaded_file is not None:
         with col_map3: address_col_input = st.selectbox("住所（または地域）の列 *", columns, index=columns.index(auto_addr))
 
         # ファイル名自動生成
-        extracted_area = "群馬県"
-        extracted_genre = "リスト"
+        extracted_area = "特定地域"
+        extracted_genre = "営業リスト"
         if address_col_input in df_uploaded.columns and not df_uploaded.empty:
             for _, row in df_uploaded.iterrows():
                 addr_str = str(row[address_col_input])
@@ -401,7 +382,6 @@ if uploaded_file is not None:
                     total_tasks = len(search_tasks)
                     completed = 0
 
-                    start_time = time.time()
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = {executor.submit(_search_worker_csv, task): task[0] for task in search_tasks}
                         for future in as_completed(futures):
@@ -415,12 +395,12 @@ if uploaded_file is not None:
                                 df_output.at[idx, '補完_取得店舗名'] = result.get('店舗名', '')
                                 df_output.at[idx, '補完_取得住所'] = result.get('住所', '')
                                 df_output.at[idx, '補完_信頼度'] = result.get('信頼度', 'Low')
-                                df_output.at[idx, '補完_エラー原因'] = "正常補完" if result.get('電話番号') else result.get('error', '電話番号がありません')
+                                df_output.at[idx, '補完_エラー原因'] = "正常補完" if result.get('電話番号') else result.get('error', '電話番号なし')
                             else:
                                 df_output.at[idx, '補完_信頼度'] = "Low"
-                                df_output.at[idx, '補完_エラー原因'] = result.get('error', '店舗が見つかりませんでした')
+                                df_output.at[idx, '補完_エラー原因'] = result.get('error', '店舗特定不可')
 
-                    # 重複行への結果コピー
+                    # 重複行への反映
                     for idx, row in df_output.iterrows():
                         if "入力値の重複" in str(df_output.at[idx, '補完_エラー原因']):
                             orig_idx = seen_keys.get((str(row[store_name_col]).strip(), str(row[address_col_input]).strip()))
@@ -433,20 +413,20 @@ if uploaded_file is not None:
                     progress_bar.progress(1.0)
                     status_text.empty()
 
-                    # ➔ ★★★【新機能】電話番号がない・エラーの行を一番下にソート整理するロジック ★★★
+                    # ➔ ★★★【新機能】電話番号がない・エラーの行を自動で確実に「一番下」に整理するソート ★★★
                     def sort_priority(r):
                         p = str(r['補完_Google掲載電話番号']).strip()
                         e = str(r['補完_エラー原因']).strip()
-                        # 電話番号が存在し、エラーでない正常データを上に（最優先: 0）
-                        if p and e in ["正常補完", "既存（スキップ）"]: return 0
-                        # 取得できなかった・エラー・空欄の行は下に（後回し: 1）
+                        # 電話番号があり、エラーでない正常補完データ・既存データを上に集める（最優先: 0）
+                        if p and e in ["正常補完", "既存（スキップ）"]:
+                            return 0
+                        # 番号がないもの、見つからなかったもの、空欄は下に（後回し: 1）
                         return 1
 
                     df_output['__sort_key__'] = df_output.apply(sort_priority, axis=1)
-                    # ソート実行後、作業用の列を削除
                     df_output = df_output.sort_values(by=['__sort_key__']).drop(columns=['__sort_key__'])
 
-                    st.success(f"📊 補完処理が完了しました！")
+                    st.success(f"📊 不足分の電話番号補完がすべて完了しました！")
                     tab_table, tab_download = st.tabs(["📊 画面表示（全列維持＋原因追加）", "📥 CSVダウンロード"])
                     with tab_table: st.dataframe(df_output, use_container_width=True)
                     with tab_download:
