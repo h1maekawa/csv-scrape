@@ -94,6 +94,55 @@ if st.sidebar.button("🗑 キャッシュをクリア", use_container_width=Tru
     st.sidebar.success("キャッシュをクリアしました")
 
 # ============================================================
+# 電話番号の標準化・フォーマット関数
+# ============================================================
+def format_phone_number(phone: str) -> str:
+    if not phone:
+        return ""
+    # 全角数字や記号を半角に変換し、前後の空白を除去
+    phone = unicodedata.normalize('NFKC', phone).strip()
+    
+    # 国際電話コード +81 を 0 に変換
+    if phone.startswith('+81'):
+        phone = '0' + phone[3:].lstrip()
+    
+    # 不要な括弧やスペースをすべてハイフンに統合
+    phone = re.sub(r'[\(\)（）\s\-]+', '-', phone)
+    phone = re.sub(r'-+', '-', phone)
+    phone = phone.strip('-')
+    
+    # 数字のみを取り出して長さをチェック
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) == 10:
+        # 東京03、大阪06などの2桁市外局番
+        if digits.startswith(('03', '06')):
+            return f"{digits[0:2]}-{digits[2:6]}-{digits[6:10]}"
+        # フリーダイヤル 0120、0800
+        elif digits.startswith('0120'):
+            return f"{digits[0:4]}-{digits[4:7]}-{digits[7:10]}"
+        elif digits.startswith('0800'):
+            return f"{digits[0:4]}-{digits[4:7]}-{digits[7:10]}"
+        # IP電話などの10桁
+        elif digits.startswith(('050', '070', '080', '090')):
+            return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+        else:
+            # 主要な3桁市外局番（札幌011、仙台022、さいたま048、横浜045、川崎044、名古屋052、京都075、神戸078、広島082、福岡092等）
+            if digits.startswith(('011', '022', '043', '044', '045', '048', '052', '072', '075', '078', '082', '092')):
+                return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+            # その他地方の4桁市外局番 (4-2-4形式) への安全なフォールバック
+            if digits.startswith('0'):
+                return f"{digits[0:4]}-{digits[4:6]}-{digits[6:10]}"
+            return phone
+    elif len(digits) == 11:
+        # 携帯電話・IP電話の11桁 (090-XXXX-XXXX, 080-XXXX-XXXX, 070-XXXX-XXXX, 050-XXXX-XXXX)
+        if digits.startswith(('050', '070', '080', '090')):
+            return f"{digits[0:3]}-{digits[3:7]}-{digits[7:11]}"
+        # 一般的な11桁フォールバック
+        return f"{digits[0:3]}-{digits[3:7]}-{digits[7:11]}"
+    
+    return phone
+
+# ============================================================
 # 表記正規化・ファジーマッチング
 # ============================================================
 def normalize_name(text: str) -> str:
@@ -193,7 +242,7 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
             phone_kg = kg.get("phone") or kg.get("formatted_phone_number")
             if phone_kg:
                 r = {
-                    'success': True, '店舗名': kg.get("title", base_name), '電話番号': phone_kg,
+                    'success': True, '店舗名': kg.get("title", base_name), '電話番号': format_phone_number(phone_kg),
                     '住所': kg.get("address") or location_hint or '',
                     '緯度': None, '経度': None, '評価': kg.get("rating", ""), 'レビュー数': kg.get("reviews", ""),
                     '信頼度': 'Very High', 'method': 'Google Web検索(ナレッジグラフ)'
@@ -209,7 +258,7 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                     if p.get("phone"):
                         gps = p.get("gps_coordinates", {})
                         r = {
-                            'success': True, '店舗名': p.get("title", base_name), '電話番号': p.get("phone"),
+                            'success': True, '店舗名': p.get("title", base_name), '電話番号': format_phone_number(p.get("phone")),
                             '住所': p.get("address") or '',
                             '緯度': gps.get('latitude') if gps else None, '経度': gps.get('longitude') if gps else None,
                             '評価': p.get("rating", ""), 'レビュー数': p.get("reviews", ""),
@@ -231,7 +280,7 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                     match = re.search(pattern, snippet_norm)
                     if match:
                         r = {
-                            'success': True, '店舗名': base_name, '電話番号': match.group(),
+                            'success': True, '店舗名': base_name, '電話番号': format_phone_number(match.group()),
                             '住所': location_hint or '', '緯度': None, '経度': None, '評価': '', 'レビュー数': '',
                             '信頼度': 'Mid', 'method': f"Webページ解析({org.get('title', 'HP')})"
                         }
@@ -290,7 +339,7 @@ def search_store_by_name(store_name, location_str=None, api_key=None, location_h
                         except: pass
 
                     r = {
-                        'success': True, '店舗名': place.get('title', store_name), '電話番号': phone,
+                        'success': True, '店舗名': place.get('title', store_name), '電話番号': format_phone_number(phone),
                         '住所': place.get('address') or place.get('住所', ''),
                         '緯度': gps.get('latitude') if gps else None, '経度': gps.get('longitude') if gps else None,
                         '評価': place.get('rating', ''), 'レビュー数': place.get('reviews', ''),
@@ -383,7 +432,7 @@ if uploaded_file is not None:
                     digits_only = re.sub(r'\D', '', p_val)
                     
                     if len(digits_only) in [10, 11]:
-                        df_output.at[idx, '補完_Google掲載電話番号'] = p_val
+                        df_output.at[idx, '補完_Google掲載電話番号'] = format_phone_number(p_val)
                         df_output.at[idx, '補完_取得店舗名'] = name
                         df_output.at[idx, '補完_信頼度'] = "Existing"
                         df_output.at[idx, '補完_エラー原因'] = "既存データ維持"
